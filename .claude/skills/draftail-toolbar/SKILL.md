@@ -63,7 +63,7 @@ def get_my_icon_choices():
 
 ```python
 class MyIconElementHandler(InlineEntityElementHandler):
-    mutability = "MUTABLE"  # Fine even though JS creates IMMUTABLE entities
+    mutability = "IMMUTABLE"  # Must match the JS entity creation — see gotchas
 
     def get_attribute_data(self, attrs):
         return {
@@ -224,6 +224,11 @@ function getMyIcons() {
 Icon entities always create a *new* entity — they must never go through the
 normal "merge with existing entity" path used by COLOR/HILITE/FSIZE.
 
+After inserting the icon entity, a trailing non-entity `\u200b` **must** be
+inserted immediately after it. Without this, Draft.js snaps the cursor back
+before the `IMMUTABLE` entity, making text typed after the icon appear before
+it instead, and leaving the cursor invisible (see IMMUTABLE cursor snap gotcha).
+
 ```js
 if (kind === "MY_ICON") {
   var iconData = mergeDataFor(kind, value, {});
@@ -234,6 +239,14 @@ if (kind === "MY_ICON") {
     content, selection,
     "\u200b",   // ← MUST be \u200b — see \u200b rule below
     style, key
+  );
+  // Trailing non-entity \u200b so cursor has a safe anchor after the icon
+  newContent = DraftJS.Modifier.insertText(
+    newContent,
+    newContent.getSelectionAfter(),
+    "\u200b",
+    style,
+    null        // no entity
   );
   onComplete(DraftJS.EditorState.push(editorState, newContent, "insert-characters"));
   return;  // ← early return skips normal merge path
@@ -450,6 +463,51 @@ The normal merge flow updates an existing entity (used by COLOR/HILITE/FSIZE).
 Icons always create a new entity. Without the early `return`, clicking to insert
 a second icon overwrites the first.
 
+### ⚠️ IMMUTABLE entity cursor snap — always insert a trailing `\u200b`
+
+Draft.js `IMMUTABLE` entities do not allow the cursor to sit inside them. When
+an `IMMUTABLE` entity is the last character in a block, Draft.js snaps the
+cursor *before* the entity on the next render. This causes two symptoms:
+
+- **Cursor not visible** after inserting the icon.
+- **Typed text appears before the icon** instead of after it.
+
+Fix: immediately after `replaceText` (the entity `\u200b`), call
+`Modifier.insertText` with `null` entity to place a non-entity `\u200b` after
+it. The cursor then lands on this trailing character, which is outside the
+entity boundary.
+
+```js
+// ✅ Correct
+newContent = DraftJS.Modifier.insertText(
+  newContent,
+  newContent.getSelectionAfter(),
+  "\u200b",
+  style,
+  null  // no entity — gives cursor a safe position after the IMMUTABLE span
+);
+
+// ❌ Wrong — cursor snaps before the icon; typing goes before the icon
+onComplete(DraftJS.EditorState.push(editorState, newContent, "insert-characters"));
+```
+
+The trailing `\u200b` is stored as invisible plain text in the DB and does not
+affect frontend rendering.
+
+### ⚠️ `mutability` in Python handler must match JS entity creation
+
+```python
+# ✅ Correct — matches JS createEntity("MY_ICON", "IMMUTABLE", ...)
+class MyIconElementHandler(InlineEntityElementHandler):
+    mutability = "IMMUTABLE"
+
+# ❌ Wrong — MUTABLE loaded from DB behaves differently from IMMUTABLE created
+#            by JS, causing inconsistent cursor behaviour between a fresh insert
+#            and re-opening an existing page for editing.
+class MyIconElementHandler(InlineEntityElementHandler):
+    mutability = "MUTABLE"
+```
+
 ### ⚠️ CSS attribute selector syntax in `from_database_format`
 
 ```python
@@ -512,4 +570,6 @@ with transaction.atomic():
    "
    ```
 4. Re-open the editor — icon must be visible.
-5. Cache-bust if needed: `touch src/wagtail_styler/static/wagtail_styler/styler-i18n-merge.js`
+5. Insert an icon at the **end** of a paragraph with no text after it — cursor must be visible and positioned after the icon, not before it.
+6. Type a character immediately after inserting the icon — it must appear after the icon, not before it.
+7. Cache-bust if needed: `touch src/wagtail_styler/static/wagtail_styler/styler-i18n-merge.js`
